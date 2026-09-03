@@ -2,6 +2,7 @@ import os
 import sqlite3
 import logging
 import threading
+import asyncio
 from datetime import datetime
 from html import escape
 
@@ -10,7 +11,6 @@ from telegram import (
     Update,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -27,29 +27,20 @@ from telegram.ext import (
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Render avtomatik beradi
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-
-# Port
 PORT = int(os.getenv("PORT", "10000"))
 
-# Haydovchilar guruhi
-DRIVERS_GROUP_ID = int(
-    os.getenv("DRIVERS_GROUP_ID", "-1004297712188")
-)
-
-# Adminlar:
-# Render Environment Variables ichida:
-# ADMIN_IDS=123456789,987654321
+DRIVERS_GROUP_ID = int(os.getenv("DRIVERS_GROUP_ID", "-1004297712188"))
 ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "")
 
-# Ma'lumotlar bazasi
 DB_FILE = "taxi_bot.db"
 
-# Conversation holatlari
 PHONE, TRIP, SUPPORT = range(3)
 
+# Flask webhook threadidan Telegram coroutine'larini
+# asosiy asyncio event loop'iga yuborish uchun.
+BOT_LOOP = None
+bot_application = None
 
 # =========================================================
 # LOGGING
@@ -61,7 +52,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("surxon_toshkent_taxi")
-
 
 # =========================================================
 # FLASK
@@ -77,35 +67,45 @@ def home():
 
 @web_app.route("/health", methods=["GET"])
 def health():
-    return jsonify(
-        {
-            "status": "ok",
-            "service": "surxon-toshkent-taxi",
-        }
-    )
+    return jsonify({
+        "status": "ok",
+        "service": "surxon-toshkent-taxi",
+    })
 
 
-# Telegram webhook manzili
 WEBHOOK_PATH = f"/telegram/{BOT_TOKEN}"
 
 
 @web_app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
     """
-    Telegramdan kelgan update'larni botga uzatadi.
+    Telegram webhookidan kelgan update'ni asosiy
+    asyncio event loop'ida xavfsiz qayta ishlaydi.
     """
+    global BOT_LOOP
+
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(silent=True)
 
         if not data:
-            return jsonify({"ok": False}), 400
+            return jsonify({"ok": False, "error": "empty update"}), 400
+
+        if bot_application is None or BOT_LOOP is None:
+            logger.error("Bot hali event loopga ulanmagan.")
+            return jsonify({"ok": False, "error": "bot not ready"}), 503
 
         update = Update.de_json(data, bot_application.bot)
 
-        bot_application.create_task(
-            bot_application.process_update(update)
+        # Flask alohida threadda ishlaydi.
+        # Coroutine'ni aynan botning asosiy event loop'iga yuboramiz.
+        future = asyncio.run_coroutine_threadsafe(
+            bot_application.process_update(update),
+            BOT_LOOP,
         )
 
+        # Telegram webhookga tezda 200 qaytaramiz.
+        # Update esa asosiy asyncio loop'ida qayta ishlanadi.
+        logger.info("Telegram update qabul qilindi.")
         return jsonify({"ok": True})
 
     except Exception as error:
@@ -114,9 +114,6 @@ def telegram_webhook():
 
 
 def run_web_server():
-    """
-    Flask server.
-    """
     web_app.run(
         host="0.0.0.0",
         port=PORT,
@@ -136,25 +133,19 @@ def get_connection():
     connection = sqlite3.connect(
         DB_FILE,
         check_same_thread=False,
+        timeout=30,
     )
-
     connection.row_factory = sqlite3.Row
-
     return connection
 
 
 def init_database():
-    """
-    Ma'lumotlar bazasini yaratadi.
-    """
-
     with db_lock:
         connection = get_connection()
 
         try:
             cursor = connection.cursor()
 
-            # Adminlar
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS admins (
@@ -164,7 +155,6 @@ def init_database():
                 """
             )
 
-            # Buyurtmalar
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS orders (
@@ -184,7 +174,6 @@ def init_database():
         finally:
             connection.close()
 
-    # Environment orqali berilgan adminlarni qo'shish
     if ADMIN_IDS_ENV:
         for value in ADMIN_IDS_ENV.split(","):
             value = value.strip()
@@ -193,8 +182,7 @@ def init_database():
                 continue
 
             try:
-                user_id = int(value)
-                add_admin(user_id)
+                add_admin(int(value))
             except ValueError:
                 logger.warning(
                     "ADMIN_IDS ichida noto'g'ri ID: %s",
@@ -215,12 +203,9 @@ def add_admin(user_id: int):
                 """,
                 (
                     user_id,
-                    datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
-
             connection.commit()
 
         finally:
@@ -236,7 +221,6 @@ def remove_admin(user_id: int):
                 "DELETE FROM admins WHERE user_id = ?",
                 (user_id,),
             )
-
             connection.commit()
 
         finally:
@@ -268,15 +252,13 @@ def get_admins():
         connection = get_connection()
 
         try:
-            rows = connection.execute(
+            return connection.execute(
                 """
                 SELECT user_id, added_at
                 FROM admins
                 ORDER BY added_at ASC
                 """
             ).fetchall()
-
-            return rows
 
         finally:
             connection.close()
@@ -312,14 +294,11 @@ def save_order(
                     username,
                     phone,
                     trip,
-                    datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
 
             connection.commit()
-
             return cursor.lastrowid
 
         finally:
@@ -332,12 +311,8 @@ def save_order(
 
 def main_menu():
     keyboard = [
-        [
-            KeyboardButton("🚕 Taksi buyurtma qilish")
-        ],
-        [
-            KeyboardButton("📞 Qo'llab-quvvatlash")
-        ],
+        [KeyboardButton("🚕 Taksi buyurtma qilish")],
+        [KeyboardButton("📞 Qo'llab-quvvatlash")],
     ]
 
     return ReplyKeyboardMarkup(
@@ -354,16 +329,19 @@ def phone_menu():
                 request_contact=True,
             )
         ],
-        [
-            KeyboardButton("📞 Qo'llab-quvvatlash")
-        ],
-        [
-            KeyboardButton("❌ Bekor qilish")
-        ],
+        [KeyboardButton("📞 Qo'llab-quvvatlash")],
+        [KeyboardButton("❌ Bekor qilish")],
     ]
 
     return ReplyKeyboardMarkup(
         keyboard,
+        resize_keyboard=True,
+    )
+
+
+def cancel_menu():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("❌ Bekor qilish")]],
         resize_keyboard=True,
     )
 
@@ -378,11 +356,14 @@ async def start(
 ):
     context.user_data.clear()
 
+    if not update.message:
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "Assalomu alaykum! 👋\n\n"
         "🚕 <b>Surxondaryo — Toshkent taksi xizmatiga</b> "
         "xush kelibsiz.\n\n"
-        "Buyurtma berish uchun quyidagi tugmani bosing:",
+        "Kerakli xizmatni tanlang:",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu(),
     )
@@ -400,10 +381,13 @@ async def start_order(
 ):
     context.user_data.clear()
 
+    if not update.message:
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "🚕 <b>Taksi buyurtmasi</b>\n\n"
         "Avvalo telefon raqamingizni yuboring.\n\n"
-        "Quyidagi tugmani bosing:",
+        "📱 Quyidagi tugmani bosing:",
         parse_mode=ParseMode.HTML,
         reply_markup=phone_menu(),
     )
@@ -412,7 +396,7 @@ async def start_order(
 
 
 # =========================================================
-# TELEFON RAQAMINI QABUL QILISH
+# TELEFON
 # =========================================================
 
 async def receive_phone(
@@ -422,31 +406,19 @@ async def receive_phone(
     message = update.message
     user = update.effective_user
 
-    if not message:
+    if not message or not user:
         return PHONE
 
-    # Qo'llab-quvvatlash
     if message.text == "📞 Qo'llab-quvvatlash":
         await message.reply_text(
             "📞 <b>Qo'llab-quvvatlash</b>\n\n"
             "Savolingiz yoki muammoingizni yozib yuboring.\n"
             "Xabaringiz operatorga yuboriladi.",
             parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardMarkup(
-                [
-                    [
-                        KeyboardButton(
-                            "❌ Bekor qilish"
-                        )
-                    ]
-                ],
-                resize_keyboard=True,
-            ),
+            reply_markup=cancel_menu(),
         )
-
         return SUPPORT
 
-    # Bekor qilish
     if message.text == "❌ Bekor qilish":
         context.user_data.clear()
 
@@ -454,25 +426,20 @@ async def receive_phone(
             "❌ Buyurtma bekor qilindi.",
             reply_markup=main_menu(),
         )
-
         return ConversationHandler.END
 
-    # Kontakt bo'lmasa
     if not message.contact:
         await message.reply_text(
-            "⚠️ Iltimos, telefon raqamingizni "
-            "qo'lda yozmang.\n\n"
+            "⚠️ Iltimos, telefon raqamingizni qo'lda yozmang.\n\n"
             "📱 <b>Telefon raqamimni yuborish</b> "
             "tugmasini bosing.",
             parse_mode=ParseMode.HTML,
             reply_markup=phone_menu(),
         )
-
         return PHONE
 
     contact = message.contact
 
-    # Boshqa odamning kontaktini yuborishdan himoya
     if (
         contact.user_id is not None
         and contact.user_id != user.id
@@ -482,12 +449,9 @@ async def receive_phone(
             "yuborishingiz mumkin.",
             reply_markup=phone_menu(),
         )
-
         return PHONE
 
-    phone = contact.phone_number
-
-    context.user_data["phone"] = phone
+    context.user_data["phone"] = contact.phone_number
 
     await message.reply_text(
         "✅ Telefon raqamingiz qabul qilindi.\n\n"
@@ -497,23 +461,14 @@ async def receive_phone(
         "5-sentabr kuni soat 08:00 da.</i>\n\n"
         "Yoki o'zingizga qulay tarzda batafsil yozishingiz mumkin.",
         parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardMarkup(
-            [
-                [
-                    KeyboardButton(
-                        "❌ Bekor qilish"
-                    )
-                ]
-            ],
-            resize_keyboard=True,
-        ),
+        reply_markup=cancel_menu(),
     )
 
     return TRIP
 
 
 # =========================================================
-# SAFAR MA'LUMOTINI QABUL QILISH
+# SAFAR
 # =========================================================
 
 async def receive_trip(
@@ -523,12 +478,11 @@ async def receive_trip(
     message = update.message
     user = update.effective_user
 
-    if not message or not message.text:
+    if not message or not message.text or not user:
         return TRIP
 
     text = message.text.strip()
 
-    # Bekor qilish
     if text == "❌ Bekor qilish":
         context.user_data.clear()
 
@@ -536,7 +490,6 @@ async def receive_trip(
             "❌ Buyurtma bekor qilindi.",
             reply_markup=main_menu(),
         )
-
         return ConversationHandler.END
 
     phone = context.user_data.get("phone")
@@ -547,9 +500,7 @@ async def receive_trip(
             "Iltimos, buyurtmani qaytadan boshlang.",
             reply_markup=main_menu(),
         )
-
         context.user_data.clear()
-
         return ConversationHandler.END
 
     if len(text) < 3:
@@ -558,17 +509,11 @@ async def receive_trip(
             "Masalan:\n"
             "Termizdan Toshkentga, ertalab soat 08:00."
         )
-
         return TRIP
 
     full_name = user.full_name or "Noma'lum"
+    username = f"@{user.username}" if user.username else "Username yo'q"
 
-    if user.username:
-        username = f"@{user.username}"
-    else:
-        username = "Username yo'q"
-
-    # Buyurtmani bazaga saqlash
     order_id = save_order(
         user_id=user.id,
         full_name=full_name,
@@ -577,30 +522,21 @@ async def receive_trip(
         trip=text,
     )
 
-    order_time = datetime.now().strftime(
-        "%d.%m.%Y %H:%M"
-    )
+    order_time = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    # HTML uchun xavfsiz matn
     safe_name = escape(full_name)
     safe_username = escape(username)
     safe_phone = escape(phone)
     safe_trip = escape(text)
 
-    # =====================================================
-    # HAYDOVCHILAR GURUHIGA XABAR
-    # =====================================================
-
     drivers_message = (
-        "🚕 <b>YANGI TAKSI BUYURTMASI!</b>\n"
-        "\n"
+        "🚕 <b>YANGI TAKSI BUYURTMASI!</b>\n\n"
         f"🆔 <b>Buyurtma:</b> #{order_id}\n"
         f"👤 <b>Mijoz:</b> {safe_name}\n"
         f"📞 <b>Telefon:</b> {safe_phone}\n"
         f"💬 <b>Telegram:</b> {safe_username}\n"
         f"📝 <b>Safar:</b> {safe_trip}\n"
-        f"🕐 <b>Buyurtma vaqti:</b> {order_time}\n"
-        "\n"
+        f"🕐 <b>Buyurtma vaqti:</b> {order_time}\n\n"
         "🚗 <b>Kim oladi?</b>"
     )
 
@@ -612,7 +548,6 @@ async def receive_trip(
             text=drivers_message,
             parse_mode=ParseMode.HTML,
         )
-
         drivers_sent = True
 
     except Exception as error:
@@ -620,10 +555,6 @@ async def receive_trip(
             "Haydovchilar guruhiga yuborishda xato: %s",
             error,
         )
-
-    # =====================================================
-    # MIJOZGA TASDIQ
-    # =====================================================
 
     if drivers_sent:
         client_text = (
@@ -649,10 +580,6 @@ async def receive_trip(
         reply_markup=main_menu(),
     )
 
-    # =====================================================
-    # ADMINLARGA XABAR
-    # =====================================================
-
     admins = get_admins()
 
     admin_message = (
@@ -673,7 +600,6 @@ async def receive_trip(
                 text=admin_message,
                 parse_mode=ParseMode.HTML,
             )
-
         except Exception as error:
             logger.warning(
                 "Admin %s ga yuborilmadi: %s",
@@ -682,7 +608,6 @@ async def receive_trip(
             )
 
     context.user_data.clear()
-
     return ConversationHandler.END
 
 
@@ -696,21 +621,15 @@ async def start_support(
 ):
     context.user_data.clear()
 
+    if not update.message:
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "📞 <b>Qo'llab-quvvatlash</b>\n\n"
         "Savolingiz yoki muammoingizni yozing.\n"
         "Xabaringiz operatorlarga yuboriladi.",
         parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardMarkup(
-            [
-                [
-                    KeyboardButton(
-                        "❌ Bekor qilish"
-                    )
-                ]
-            ],
-            resize_keyboard=True,
-        ),
+        reply_markup=cancel_menu(),
     )
 
     return SUPPORT
@@ -723,7 +642,7 @@ async def receive_support(
     message = update.message
     user = update.effective_user
 
-    if not message or not message.text:
+    if not message or not message.text or not user:
         return SUPPORT
 
     text = message.text.strip()
@@ -735,37 +654,28 @@ async def receive_support(
             "❌ Bekor qilindi.",
             reply_markup=main_menu(),
         )
-
         return ConversationHandler.END
 
     if len(text) < 2:
         await message.reply_text(
             "⚠️ Iltimos, xabaringizni yozing."
         )
-
         return SUPPORT
 
     full_name = user.full_name or "Noma'lum"
-
-    username = (
-        f"@{user.username}"
-        if user.username
-        else "Username yo'q"
-    )
+    username = f"@{user.username}" if user.username else "Username yo'q"
 
     support_message = (
         "📞 <b>QO'LLAB-QUVVATLASH XABARI</b>\n\n"
         f"👤 <b>Mijoz:</b> {escape(full_name)}\n"
         f"💬 <b>Telegram:</b> {escape(username)}\n"
-        f"🆔 <b>Telegram ID:</b> "
-        f"<code>{user.id}</code>\n\n"
+        f"🆔 <b>Telegram ID:</b> <code>{user.id}</code>\n\n"
         f"💬 <b>Xabar:</b>\n{escape(text)}\n\n"
         "Javob berish:\n"
         f"<code>/reply {user.id} Javobingiz</code>"
     )
 
     admins = get_admins()
-
     sent_count = 0
 
     for admin in admins:
@@ -775,9 +685,7 @@ async def receive_support(
                 text=support_message,
                 parse_mode=ParseMode.HTML,
             )
-
             sent_count += 1
-
         except Exception as error:
             logger.warning(
                 "Support admin xatosi: %s",
@@ -798,7 +706,6 @@ async def receive_support(
         )
 
     context.user_data.clear()
-
     return ConversationHandler.END
 
 
@@ -812,10 +719,11 @@ async def cancel(
 ):
     context.user_data.clear()
 
-    await update.message.reply_text(
-        "❌ Bekor qilindi.",
-        reply_markup=main_menu(),
-    )
+    if update.message:
+        await update.message.reply_text(
+            "❌ Bekor qilindi.",
+            reply_markup=main_menu(),
+        )
 
     return ConversationHandler.END
 
@@ -828,27 +736,31 @@ async def my_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message or not update.effective_user:
+        return
+
     await update.message.reply_text(
-        f"🆔 Sizning Telegram ID raqamingiz:\n\n"
+        "🆔 Sizning Telegram ID raqamingiz:\n\n"
         f"<code>{update.effective_user.id}</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
 # =========================================================
-# ADD ADMIN
+# ADMIN
 # =========================================================
 
 async def add_admin_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message or not update.effective_user:
+        return
+
     user_id = update.effective_user.id
 
     if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Sizda admin huquqi yo'q."
-        )
+        await update.message.reply_text("⛔ Sizda admin huquqi yo'q.")
         return
 
     if not context.args:
@@ -861,7 +773,6 @@ async def add_admin_command(
 
     try:
         new_admin_id = int(context.args[0])
-
     except ValueError:
         await update.message.reply_text(
             "⚠️ Telegram ID faqat raqam bo'lishi kerak."
@@ -876,20 +787,17 @@ async def add_admin_command(
     )
 
 
-# =========================================================
-# DELETE ADMIN
-# =========================================================
-
 async def delete_admin_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message or not update.effective_user:
+        return
+
     user_id = update.effective_user.id
 
     if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Sizda admin huquqi yo'q."
-        )
+        await update.message.reply_text("⛔ Sizda admin huquqi yo'q.")
         return
 
     if not context.args:
@@ -902,18 +810,15 @@ async def delete_admin_command(
 
     try:
         admin_id = int(context.args[0])
-
     except ValueError:
         await update.message.reply_text(
             "⚠️ Telegram ID faqat raqam bo'lishi kerak."
         )
         return
 
-    # O'zini o'zi o'chirishga ruxsat bermaymiz
     if admin_id == user_id:
         await update.message.reply_text(
-            "⚠️ O'zingizni adminlar ro'yxatidan "
-            "o'chira olmaysiz."
+            "⚠️ O'zingizni adminlar ro'yxatidan o'chira olmaysiz."
         )
         return
 
@@ -925,37 +830,29 @@ async def delete_admin_command(
     )
 
 
-# =========================================================
-# ADMINS
-# =========================================================
-
 async def admins_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message or not update.effective_user:
+        return
+
     user_id = update.effective_user.id
 
     if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Sizda admin huquqi yo'q."
-        )
+        await update.message.reply_text("⛔ Sizda admin huquqi yo'q.")
         return
 
     admins = get_admins()
 
     if not admins:
-        await update.message.reply_text(
-            "Adminlar ro'yxati bo'sh."
-        )
+        await update.message.reply_text("Adminlar ro'yxati bo'sh.")
         return
 
     text = "👨‍💼 <b>ADMINLAR</b>\n\n"
 
     for index, admin in enumerate(admins, start=1):
-        text += (
-            f"{index}. "
-            f"<code>{admin['user_id']}</code>\n"
-        )
+        text += f"{index}. <code>{admin['user_id']}</code>\n"
 
     await update.message.reply_text(
         text,
@@ -971,12 +868,13 @@ async def reply_to_user(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message or not update.effective_user:
+        return
+
     admin_id = update.effective_user.id
 
     if not is_admin(admin_id):
-        await update.message.reply_text(
-            "⛔ Sizda admin huquqi yo'q."
-        )
+        await update.message.reply_text("⛔ Sizda admin huquqi yo'q.")
         return
 
     if len(context.args) < 2:
@@ -992,11 +890,8 @@ async def reply_to_user(
 
     try:
         target_user_id = int(context.args[0])
-
     except ValueError:
-        await update.message.reply_text(
-            "⚠️ USER_ID noto'g'ri."
-        )
+        await update.message.reply_text("⚠️ USER_ID noto'g'ri.")
         return
 
     reply_text = " ".join(context.args[1:]).strip()
@@ -1041,6 +936,9 @@ async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message or not update.effective_user:
+        return
+
     user_id = update.effective_user.id
 
     if is_admin(user_id):
@@ -1054,7 +952,6 @@ async def help_command(
             "/reply ID matn — Mijozga javob berish\n"
             "/cancel — Amalni bekor qilish"
         )
-
     else:
         text = (
             "ℹ️ <b>YORDAM</b>\n\n"
@@ -1085,23 +982,19 @@ async def error_handler(
 
 
 # =========================================================
-# GLOBAL APPLICATION
-# =========================================================
-
-bot_application: Application = None
-
-
-# =========================================================
 # MAIN
 # =========================================================
 
 def main():
-    global bot_application
+    global bot_application, BOT_LOOP
 
-    # Database
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN Render Environment Variables ichida topilmadi."
+        )
+
     init_database()
 
-    # Telegram application
     bot_application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1114,17 +1007,12 @@ def main():
 
     conversation_handler = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start_order),
             MessageHandler(
-                filters.Regex(
-                    "^🚕 Taksi buyurtma qilish$"
-                ),
+                filters.Regex(r"^🚕 Taksi buyurtma qilish$"),
                 start_order,
             ),
             MessageHandler(
-                filters.Regex(
-                    "^📞 Qo'llab-quvvatlash$"
-                ),
+                filters.Regex(r"^📞 Qo'llab-quvvatlash$"),
                 start_support,
             ),
         ],
@@ -1164,12 +1052,13 @@ def main():
         allow_reentry=True,
     )
 
-    # Conversation
+    bot_application.add_handler(conversation_handler)
+
+    # /start alohida ishlaydi va asosiy menyuni chiqaradi.
     bot_application.add_handler(
-        conversation_handler
+        CommandHandler("start", start)
     )
 
-    # Commands
     bot_application.add_handler(
         CommandHandler("cancel", cancel)
     )
@@ -1179,52 +1068,35 @@ def main():
     )
 
     bot_application.add_handler(
-        CommandHandler(
-            "addadmin",
-            add_admin_command,
-        )
+        CommandHandler("addadmin", add_admin_command)
     )
 
     bot_application.add_handler(
-        CommandHandler(
-            "deladmin",
-            delete_admin_command,
-        )
+        CommandHandler("deladmin", delete_admin_command)
     )
 
     bot_application.add_handler(
-        CommandHandler(
-            "admins",
-            admins_command,
-        )
+        CommandHandler("admins", admins_command)
     )
 
     bot_application.add_handler(
-        CommandHandler(
-            "reply",
-            reply_to_user,
-        )
+        CommandHandler("reply", reply_to_user)
     )
 
     bot_application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
+        CommandHandler("help", help_command)
     )
 
-    # Error
-    bot_application.add_error_handler(
-        error_handler
-    )
+    bot_application.add_error_handler(error_handler)
 
     # =====================================================
-    # FLASK SERVERNI ALOHIDA THREADDA ISHGA TUSHIRISH
+    # FLASK SERVER
     # =====================================================
 
     server_thread = threading.Thread(
         target=run_web_server,
         daemon=True,
+        name="flask-server",
     )
 
     server_thread.start()
@@ -1233,13 +1105,16 @@ def main():
     # TELEGRAM BOT
     # =====================================================
 
-    import asyncio
-
     async def start_bot():
+        global BOT_LOOP
+
+        # Eng muhim qism:
+        # webhook threadi aynan shu event loop'dan foydalanadi.
+        BOT_LOOP = asyncio.get_running_loop()
+
         await bot_application.initialize()
         await bot_application.start()
 
-        # Webhook URL
         if RENDER_EXTERNAL_URL:
             webhook_url = (
                 f"{RENDER_EXTERNAL_URL}"
@@ -1252,18 +1127,24 @@ def main():
                 drop_pending_updates=True,
             )
 
+            # Tokenni logga to'liq chiqarmaymiz.
             logger.info(
-                "Webhook o'rnatildi: %s",
-                webhook_url,
+                "Telegram webhook o'rnatildi: %s/telegram/[TOKEN]",
+                RENDER_EXTERNAL_URL,
             )
-
         else:
             logger.warning(
                 "RENDER_EXTERNAL_URL topilmadi."
             )
 
-        # Botni doimiy ishlatib turish
-        await asyncio.Event().wait()
+        logger.info("Telegram bot ishga tayyor.")
+
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await bot_application.stop()
+            await bot_application.shutdown()
+            BOT_LOOP = None
 
     try:
         asyncio.run(start_bot())
@@ -1278,14 +1159,5 @@ def main():
         )
 
 
-# =========================================================
-# START
-# =========================================================
-
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN Render Environment Variables ichida topilmadi."
-        )
-
     main()
