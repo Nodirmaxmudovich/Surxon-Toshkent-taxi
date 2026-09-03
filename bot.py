@@ -11,6 +11,8 @@ from telegram import (
     Update,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -19,6 +21,7 @@ from telegram.ext import (
     MessageHandler,
     ConversationHandler,
     ContextTypes,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -164,10 +167,29 @@ def init_database():
                     username TEXT,
                     phone TEXT NOT NULL,
                     trip TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    claimed_by INTEGER,
+                    claimed_name TEXT,
+                    claimed_phone TEXT
                 )
                 """
             )
+
+            # Eski taxi_bot.db bo'lsa, yangi ustunlarni qo'shamiz.
+            existing_columns = {
+                row["name"]
+                for row in cursor.execute("PRAGMA table_info(orders)").fetchall()
+            }
+
+            for column, definition in (
+                ("claimed_by", "INTEGER"),
+                ("claimed_name", "TEXT"),
+                ("claimed_phone", "TEXT"),
+            ):
+                if column not in existing_columns:
+                    cursor.execute(
+                        f"ALTER TABLE orders ADD COLUMN {column} {definition}"
+                    )
 
             connection.commit()
 
@@ -300,6 +322,72 @@ def save_order(
 
             connection.commit()
             return cursor.lastrowid
+
+        finally:
+            connection.close()
+
+
+def claim_order(order_id: int, driver_id: int, driver_name: str, driver_phone: str = ""):
+    """Buyurtmani birinchi bo'lib bosgan haydovchiga biriktiradi."""
+    with db_lock:
+        connection = get_connection()
+
+        try:
+            row = connection.execute(
+                """
+                SELECT id, user_id, full_name, phone, trip,
+                       claimed_by, claimed_name, claimed_phone
+                FROM orders
+                WHERE id = ?
+                """,
+                (order_id,),
+            ).fetchone()
+
+            if row is None:
+                return {"status": "not_found"}
+
+            if row["claimed_by"] is not None:
+                return {
+                    "status": "already_claimed",
+                    "driver_name": row["claimed_name"] or "Noma'lum haydovchi",
+                    "driver_phone": row["claimed_phone"] or "",
+                    "user_id": row["user_id"],
+                }
+
+            connection.execute(
+                """
+                UPDATE orders
+                SET claimed_by = ?, claimed_name = ?, claimed_phone = ?
+                WHERE id = ? AND claimed_by IS NULL
+                """,
+                (driver_id, driver_name, driver_phone, order_id),
+            )
+            connection.commit()
+
+            # Race-condition bo'lsa ham birinchi claim yutadi.
+            updated = connection.execute(
+                """
+                SELECT claimed_by, claimed_name, claimed_phone, user_id
+                FROM orders
+                WHERE id = ?
+                """,
+                (order_id,),
+            ).fetchone()
+
+            if updated["claimed_by"] != driver_id:
+                return {
+                    "status": "already_claimed",
+                    "driver_name": updated["claimed_name"] or "Noma'lum haydovchi",
+                    "driver_phone": updated["claimed_phone"] or "",
+                    "user_id": updated["user_id"],
+                }
+
+            return {
+                "status": "claimed",
+                "user_id": updated["user_id"],
+                "driver_name": driver_name,
+                "driver_phone": driver_phone,
+            }
 
         finally:
             connection.close()
@@ -543,10 +631,22 @@ async def receive_trip(
     drivers_sent = False
 
     try:
+        claim_keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🚗 MEN OLAMAN",
+                        callback_data=f"claim:{order_id}",
+                    )
+                ]
+            ]
+        )
+
         await context.bot.send_message(
             chat_id=DRIVERS_GROUP_ID,
             text=drivers_message,
             parse_mode=ParseMode.HTML,
+            reply_markup=claim_keyboard,
         )
         drivers_sent = True
 
@@ -707,6 +807,157 @@ async def receive_support(
 
     context.user_data.clear()
     return ConversationHandler.END
+
+
+# =========================================================
+# HAYDOVCHI BUYURTMANI OLADI
+# =========================================================
+
+async def claim_order_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    if not query.data.startswith("claim:"):
+        return
+
+    try:
+        order_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("⚠️ Buyurtma raqami noto'g'ri.", show_alert=True)
+        return
+
+    driver = query.from_user
+    driver_name = driver.full_name or "Noma'lum haydovchi"
+
+    # Hozircha haydovchidan alohida telefon so'ramaymiz.
+    # Telegram username bo'lsa, uni ham saqlaymiz.
+    driver_phone = (
+        f"@{driver.username}"
+        if driver.username
+        else ""
+    )
+
+    result = claim_order(
+        order_id=order_id,
+        driver_id=driver.id,
+        driver_name=driver_name,
+        driver_phone=driver_phone,
+    )
+
+    if result["status"] == "not_found":
+        await query.answer(
+            "❌ Bu buyurtma topilmadi.",
+            show_alert=True,
+        )
+        return
+
+    if result["status"] == "already_claimed":
+        claimed_name = escape(result["driver_name"])
+        claimed_contact = escape(result["driver_phone"])
+
+        extra = (
+            f"\n📞 Telegram: {claimed_contact}"
+            if claimed_contact
+            else ""
+        )
+
+        await query.answer(
+            f"❌ Bu buyurtmani {result['driver_name']} oldi.",
+            show_alert=True,
+        )
+
+        try:
+            if query.message:
+                await query.message.edit_reply_markup(
+                    reply_markup=None
+                )
+        except Exception:
+            pass
+
+        return
+
+    # Buyurtma muvaffaqiyatli olindi.
+    driver_contact = (
+        f"@{driver.username}"
+        if driver.username
+        else f"ID: {driver.id}"
+    )
+
+    if query.message:
+        try:
+            old_text = query.message.text or ""
+
+            new_text = (
+                old_text
+                + "\n\n"
+                + "━━━━━━━━━━━━━━━━━━\n"
+                + "✅ <b>BUYURTMA OLINDI</b>\n"
+                + f"🚗 <b>Haydovchi:</b> {escape(driver_name)}\n"
+                + f"💬 <b>Telegram:</b> {escape(driver_contact)}"
+            )
+
+            await query.message.edit_text(
+                new_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception as error:
+            logger.warning(
+                "Haydovchi olgan buyurtma xabarini yangilashda xato: %s",
+                error,
+            )
+
+    # Mijozga haydovchi buyurtmani olgani haqida xabar.
+    try:
+        customer_message = (
+            "🚗 <b>Haydovchi buyurtmangizni oldi!</b>\n\n"
+            f"🆔 Buyurtma: <b>#{order_id}</b>\n"
+            f"👤 Haydovchi: <b>{escape(driver_name)}</b>\n"
+            f"💬 Telegram: <b>{escape(driver_contact)}</b>\n\n"
+            "Tez orada haydovchi siz bilan bog'lanadi."
+        )
+
+        await context.bot.send_message(
+            chat_id=result["user_id"],
+            text=customer_message,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as error:
+        logger.warning(
+            "Mijozga haydovchi olgani haqida xabar yuborilmadi: %s",
+            error,
+        )
+
+    # Adminlarga ham xabar beramiz.
+    admins = get_admins()
+
+    admin_message = (
+        "🚗 <b>BUYURTMA HAYDOVCHIGA BIRIKTIRILDI</b>\n\n"
+        f"🆔 Buyurtma: <b>#{order_id}</b>\n"
+        f"🚗 Haydovchi: <b>{escape(driver_name)}</b>\n"
+        f"💬 Telegram: <b>{escape(driver_contact)}</b>"
+    )
+
+    for admin in admins:
+        try:
+            await context.bot.send_message(
+                chat_id=admin["user_id"],
+                text=admin_message,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as error:
+            logger.warning(
+                "Admin %s ga haydovchi xabari yuborilmadi: %s",
+                admin["user_id"],
+                error,
+            )
 
 
 # =========================================================
@@ -1053,6 +1304,14 @@ def main():
     )
 
     bot_application.add_handler(conversation_handler)
+
+    # Haydovchi "MEN OLAMAN" tugmasini bosganda.
+    bot_application.add_handler(
+        CallbackQueryHandler(
+            claim_order_callback,
+            pattern=r"^claim:\d+$",
+        )
+    )
 
     # /start alohida ishlaydi va asosiy menyuni chiqaradi.
     bot_application.add_handler(
