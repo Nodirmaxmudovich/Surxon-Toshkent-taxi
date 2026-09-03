@@ -9,7 +9,6 @@ from telegram import (
     Update,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -20,18 +19,20 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
 # SOZLAMALAR
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
-
 PORT = int(os.getenv("PORT", "10000"))
+
 DB_FILE = "taxi_bot.db"
 
-# Suhbat bosqichlari
+# Suhbat holatlari
 MENU, PHONE, TRIP, SUPPORT = range(4)
+
 
 if not BOT_TOKEN:
     raise RuntimeError(
@@ -53,7 +54,7 @@ logger = logging.getLogger("surxon_toshkent_taxi")
 
 
 # ============================================================
-# FLASK - RENDER PORT UCHUN
+# FLASK
 # ============================================================
 
 app = Flask(__name__)
@@ -88,17 +89,22 @@ db_lock = threading.Lock()
 def get_connection():
     connection = sqlite3.connect(
         DB_FILE,
-        check_same_thread=False
+        check_same_thread=False,
     )
+
     connection.row_factory = sqlite3.Row
+
     return connection
 
 
 def init_database():
+
     with db_lock:
+
         connection = get_connection()
         cursor = connection.cursor()
 
+        # Adminlar
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -106,6 +112,7 @@ def init_database():
             )
         """)
 
+        # Buyurtmalar
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,11 +125,26 @@ def init_database():
             )
         """)
 
+        # Support xabarlari
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS support_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL,
+                admin_id INTEGER NOT NULL,
+                admin_message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(admin_id, admin_message_id)
+            )
+        """)
+
         connection.commit()
         connection.close()
 
+    # Environment Variables dagi adminlarni bazaga qo'shish
     if ADMIN_IDS.strip():
+
         for admin_id in ADMIN_IDS.split(","):
+
             admin_id = admin_id.strip()
 
             if admin_id.isdigit():
@@ -130,7 +152,9 @@ def init_database():
 
 
 def add_admin(user_id: int):
+
     with db_lock:
+
         connection = get_connection()
         cursor = connection.cursor()
 
@@ -140,7 +164,7 @@ def add_admin(user_id: int):
             VALUES (?, ?)
         """, (
             user_id,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ))
 
         connection.commit()
@@ -148,13 +172,15 @@ def add_admin(user_id: int):
 
 
 def remove_admin(user_id: int):
+
     with db_lock:
+
         connection = get_connection()
         cursor = connection.cursor()
 
         cursor.execute(
             "DELETE FROM admins WHERE user_id = ?",
-            (user_id,)
+            (user_id,),
         )
 
         connection.commit()
@@ -162,23 +188,28 @@ def remove_admin(user_id: int):
 
 
 def is_admin(user_id: int) -> bool:
+
     with db_lock:
+
         connection = get_connection()
         cursor = connection.cursor()
 
         cursor.execute(
             "SELECT user_id FROM admins WHERE user_id = ?",
-            (user_id,)
+            (user_id,),
         )
 
         result = cursor.fetchone()
+
         connection.close()
 
         return result is not None
 
 
 def get_admins():
+
     with db_lock:
+
         connection = get_connection()
         cursor = connection.cursor()
 
@@ -187,25 +218,27 @@ def get_admins():
         )
 
         rows = cursor.fetchall()
+
         connection.close()
 
         return [row["user_id"] for row in rows]
 
 
 def save_order(
-    user_id: int,
-    full_name: str,
-    username: str,
-    phone: str,
-    trip: str,
+    user_id,
+    full_name,
+    username,
+    phone,
+    trip,
 ):
+
     with db_lock:
+
         connection = get_connection()
         cursor = connection.cursor()
 
         cursor.execute("""
-            INSERT INTO orders
-            (
+            INSERT INTO orders (
                 user_id,
                 full_name,
                 username,
@@ -220,7 +253,7 @@ def save_order(
             username,
             phone,
             trip,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ))
 
         order_id = cursor.lastrowid
@@ -231,29 +264,106 @@ def save_order(
         return order_id
 
 
+def save_support_message(
+    client_id,
+    admin_id,
+    admin_message_id,
+):
+
+    with db_lock:
+
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO support_messages (
+                client_id,
+                admin_id,
+                admin_message_id,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            client_id,
+            admin_id,
+            admin_message_id,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
+
+        connection.commit()
+        connection.close()
+
+
+def get_client_by_support_message(
+    admin_id,
+    admin_message_id,
+):
+
+    with db_lock:
+
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            SELECT client_id
+            FROM support_messages
+            WHERE admin_id = ?
+            AND admin_message_id = ?
+        """, (
+            admin_id,
+            admin_message_id,
+        ))
+
+        row = cursor.fetchone()
+
+        connection.close()
+
+        if row:
+            return row["client_id"]
+
+        return None
+
+
 # ============================================================
-# ASOSIY MENYU
+# MENYU
 # ============================================================
 
 def main_menu_keyboard():
-    keyboard = [
-        [
-            KeyboardButton("🚕 Taksi buyurtma qilish")
-        ],
-        [
-            KeyboardButton("📞 Qo'llab-quvvatlash")
-        ],
-    ]
 
     return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True
+        [
+            [
+                KeyboardButton(
+                    "🚕 Taksi buyurtma qilish"
+                )
+            ],
+            [
+                KeyboardButton(
+                    "📞 Qo'llab-quvvatlash"
+                )
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def back_menu_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton(
+                    "⬅️ Asosiy menyu"
+                )
+            ]
+        ],
+        resize_keyboard=True,
     )
 
 
 async def show_main_menu(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     context.user_data.clear()
@@ -261,108 +371,117 @@ async def show_main_menu(
     await update.message.reply_text(
         "🏠 ASOSIY MENYU\n\n"
         "Kerakli bo'limni tanlang:",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(),
     )
 
     return MENU
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    user = update.effective_user
-
     context.user_data.clear()
+
+    user = update.effective_user
 
     await update.message.reply_text(
         f"Assalomu alaykum, {user.first_name}! 👋\n\n"
         "🚕 Surxon–Toshkent taksi xizmatiga xush kelibsiz.\n\n"
         "Kerakli bo'limni tanlang:",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(),
     )
 
     return MENU
 
 
 # ============================================================
-# TAKSI BUYURTMASINI BOSHLASH
+# TAKSI BUYURTMASI
 # ============================================================
 
 async def start_order(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     keyboard = [
         [
             KeyboardButton(
                 "📱 Telefon raqamimni yuborish",
-                request_contact=True
+                request_contact=True,
             )
         ],
         [
-            KeyboardButton("⬅️ Asosiy menyu")
-        ]
+            KeyboardButton(
+                "⬅️ Asosiy menyu"
+            )
+        ],
     ]
 
     markup = ReplyKeyboardMarkup(
         keyboard,
         resize_keyboard=True,
-        one_time_keyboard=True
+        one_time_keyboard=True,
     )
 
     await update.message.reply_text(
         "🚕 TAKSI BUYURTMASI\n\n"
         "Buyurtma berish uchun telefon raqamingizni "
         "yuboring.",
-        reply_markup=markup
+        reply_markup=markup,
     )
 
     return PHONE
 
 
 # ============================================================
-# TELEFON RAQAMINI QABUL QILISH
+# TELEFON
 # ============================================================
 
 async def receive_phone(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     message = update.message
     user = update.effective_user
 
-    # Asosiy menyuga qaytish
     if message.text == "⬅️ Asosiy menyu":
-        return await show_main_menu(update, context)
+
+        return await show_main_menu(
+            update,
+            context,
+        )
 
     if not message.contact:
+
         await message.reply_text(
             "❗ Iltimos, pastdagi tugma orqali "
             "o'zingizning telefon raqamingizni yuboring."
         )
+
         return PHONE
 
     contact = message.contact
 
-    if contact.user_id is not None:
-        if contact.user_id != user.id:
-            await message.reply_text(
-                "❗ Iltimos, o'zingizning telefon "
-                "raqamingizni yuboring."
-            )
-            return PHONE
+    if (
+        contact.user_id is not None
+        and contact.user_id != user.id
+    ):
 
-    phone = contact.phone_number
+        await message.reply_text(
+            "❗ Iltimos, o'zingizning telefon "
+            "raqamingizni yuboring."
+        )
 
-    context.user_data["phone"] = phone
+        return PHONE
+
+    context.user_data["phone"] = contact.phone_number
 
     await message.reply_text(
         "✅ Telefon raqamingiz qabul qilindi.\n\n"
@@ -371,82 +490,86 @@ async def receive_phone(
         "📍 Termizdan Toshkentga\n"
         "📅 5-sentabr\n"
         "⏰ Soat 07:00\n\n"
-        "Yoki barchasini bitta xabarda yozishingiz mumkin.\n\n"
         "✏️ Qayerdan, qayerga va qachon "
-        "borishingizni o'zingiz yozing.",
-        reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("⬅️ Asosiy menyu")]],
-            resize_keyboard=True
-        )
+        "borishingizni yozing.",
+        reply_markup=back_menu_keyboard(),
     )
 
     return TRIP
 
 
 # ============================================================
-# SAFAR MA'LUMOTINI QABUL QILISH
+# SAFAR
 # ============================================================
 
 async def receive_trip(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     message = update.message
     user = update.effective_user
 
     if message.text == "⬅️ Asosiy menyu":
-        return await show_main_menu(update, context)
 
-    trip = message.text.strip()
+        return await show_main_menu(
+            update,
+            context,
+        )
+
+    trip = (message.text or "").strip()
 
     if not trip:
+
         await message.reply_text(
             "❗ Iltimos, qayerdan, qayerga va qachon "
             "borishingizni yozing."
         )
+
         return TRIP
 
     phone = context.user_data.get("phone")
 
     if not phone:
+
         await message.reply_text(
             "❗ Telefon raqamingiz topilmadi.\n\n"
-            "Iltimos, /start tugmasini bosib "
-            "buyurtmani qaytadan boshlang."
+            "Iltimos, /start orqali qaytadan boshlang.",
+            reply_markup=main_menu_keyboard(),
         )
 
         context.user_data.clear()
-        return ConversationHandler.END
+
+        return MENU
 
     full_name = user.full_name or "Noma'lum"
 
-    username = (
-        f"@{user.username}"
-        if user.username
-        else "Username yo'q"
-    )
+    if user.username:
+
+        username = f"@{user.username}"
+
+    else:
+
+        username = "Username yo'q"
 
     order_id = save_order(
-        user_id=user.id,
-        full_name=full_name,
-        username=username,
-        phone=phone,
-        trip=trip,
+        user.id,
+        full_name,
+        username,
+        phone,
+        trip,
     )
 
+    # Mijozga javob
     await message.reply_text(
         "🙏 Buyurtmangiz uchun tashakkur!\n\n"
-        "🚕 Haydovchilarimiz tez orada sizga "
-        "aloqaga chiqishadi.\n\n"
+        "🚕 Haydovchilarimiz tez orada siz bilan "
+        "bog'lanishadi.\n\n"
         "📞 Iltimos, telefoningizni kuzatib turing.",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(),
     )
 
-    # ========================================================
-    # ADMINLARGA BUYURTMA
-    # ========================================================
-
+    # Adminlarga yuboriladigan xabar
     admin_message = (
         "🚕 YANGI TAKSI BUYURTMASI\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -466,25 +589,29 @@ async def receive_trip(
     admins = get_admins()
 
     if not admins:
+
         logger.warning(
-            "Adminlar ro'yxati bo'sh. Buyurtma #%s "
-            "hech kimga yuborilmadi.",
-            order_id
+            "Adminlar ro'yxati bo'sh. "
+            "Buyurtma #%s yuborilmadi.",
+            order_id,
         )
 
     for admin_id in admins:
+
         try:
+
             await context.bot.send_message(
                 chat_id=admin_id,
-                text=admin_message
+                text=admin_message,
             )
 
         except Exception as error:
+
             logger.error(
                 "Admin %s ga buyurtma #%s yuborilmadi: %s",
                 admin_id,
                 order_id,
-                error
+                error,
             )
 
     context.user_data.clear()
@@ -493,68 +620,63 @@ async def receive_trip(
 
 
 # ============================================================
-# QO'LLAB-QUVVATLASHNI BOSHLASH
+# QO'LLAB-QUVVATLASH
 # ============================================================
 
 async def start_support(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     context.user_data.clear()
 
-    keyboard = [
-        [
-            KeyboardButton("⬅️ Asosiy menyu")
-        ]
-    ]
-
-    markup = ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True
-    )
-
     await update.message.reply_text(
         "📞 QO'LLAB-QUVVATLASH\n\n"
         "Savol, taklif yoki muammoingiz bo'lsa, "
-        "xabarni shu yerga yozing.\n\n"
-        "👨‍💼 Operatorimiz xabaringizni ko'rib chiqib, "
-        "siz bilan bog'lanadi.\n\n"
+        "shu yerga yozing.\n\n"
+        "👨‍💼 Operatorimiz xabaringizni ko'rib chiqadi "
+        "va sizga javob beradi.\n\n"
         "✏️ Xabaringizni yozing:",
-        reply_markup=markup
+        reply_markup=back_menu_keyboard(),
     )
 
     return SUPPORT
 
 
-# ============================================================
-# QO'LLAB-QUVVATLASH XABARINI QABUL QILISH
-# ============================================================
-
 async def receive_support(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     message = update.message
     user = update.effective_user
 
     if message.text == "⬅️ Asosiy menyu":
-        return await show_main_menu(update, context)
 
-    if not message.text:
+        return await show_main_menu(
+            update,
+            context,
+        )
+
+    support_text = (message.text or "").strip()
+
+    if not support_text:
+
         await message.reply_text(
             "❗ Iltimos, xabaringizni matn ko'rinishida yuboring."
         )
+
         return SUPPORT
 
     full_name = user.full_name or "Noma'lum"
 
-    username = (
-        f"@{user.username}"
-        if user.username
-        else "Username yo'q"
-    )
+    if user.username:
+
+        username = f"@{user.username}"
+
+    else:
+
+        username = "Username yo'q"
 
     support_message = (
         "📞 QO'LLAB-QUVVATLASH XABARI\n"
@@ -564,297 +686,68 @@ async def receive_support(
         f"🆔 Telegram ID: {user.id}\n\n"
         "💬 MIJOZ XABARI:\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{message.text}\n"
+        f"{support_text}\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "↩️ Javob berish uchun ushbu xabarga "
-        "Reply qiling."
+        "↩️ Mijozga javob berish uchun "
+        "shu xabarga REPLY qiling."
     )
 
     admins = get_admins()
 
     if not admins:
+
         await message.reply_text(
             "⚠️ Hozircha operator mavjud emas.\n\n"
             "Iltimos, keyinroq qayta urinib ko'ring.",
-            reply_markup=main_menu_keyboard()
+            reply_markup=main_menu_keyboard(),
         )
+
+        context.user_data.clear()
+
         return MENU
 
     sent_count = 0
 
     for admin_id in admins:
+
         try:
-            await context.bot.send_message(
+
+            sent_message = await context.bot.send_message(
                 chat_id=admin_id,
-                text=support_message
+                text=support_message,
+            )
+
+            save_support_message(
+                client_id=user.id,
+                admin_id=admin_id,
+                admin_message_id=sent_message.message_id,
             )
 
             sent_count += 1
 
         except Exception as error:
+
             logger.error(
                 "Support xabari admin %s ga yuborilmadi: %s",
                 admin_id,
-                error
+                error,
             )
 
     if sent_count > 0:
+
         await message.reply_text(
             "✅ Xabaringiz operatorga yuborildi.\n\n"
-            "📞 Operatorimiz tez orada siz bilan bog'lanadi.",
-            reply_markup=main_menu_keyboard()
+            "📞 Operatorimiz tez orada sizga javob beradi.",
+            reply_markup=main_menu_keyboard(),
         )
+
     else:
+
         await message.reply_text(
             "⚠️ Xabaringizni operatorga yuborishda "
             "xatolik yuz berdi.\n\n"
             "Iltimos, keyinroq qayta urinib ko'ring.",
-            reply_markup=main_menu_keyboard()
+            reply_markup=main_menu_keyboard(),
         )
 
-    context.user_data.clear()
-
-    return MENU
-
-
-# ============================================================
-# ADMINNING MIJOZGA JAVOBI
-# ============================================================
-
-async def admin_reply_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.message
-
-    if not message:
-        return
-
-    admin_user = update.effective_user
-
-    if not admin_user:
-        return
-
-    if not is_admin(admin_user.id):
-        return
-
-    if not message.reply_to_message:
-        return
-
-    replied_text = message.reply_to_message.text or ""
-
-    marker = "🆔 Telegram ID:"
-
-    if marker not in replied_text:
-        return
-
-    try:
-        after_marker = replied_text.split(
-            marker,
-            1
-        )[1]
-
-        client_id_text = after_marker.split(
-            "\n",
-            1
-        )[0].strip()
-
-        client_id = int(client_id_text)
-
-    except (ValueError, IndexError):
-        await message.reply_text(
-            "❌ Mijoz Telegram ID sini aniqlab bo'lmadi."
-        )
-        return
-
-    if not message.text:
-        await message.reply_text(
-            "❗ Hozircha faqat matnli javob yuborish mumkin."
-        )
-        return
-
-    try:
-        await context.bot.send_message(
-            chat_id=client_id,
-            text=(
-                "👨‍💼 OPERATOR JAVOBI\n\n"
-                f"{message.text}"
-            )
-        )
-
-        await message.reply_text(
-            "✅ Javob mijozga yuborildi."
-        )
-
-    except Exception as error:
-        logger.error(
-            "Mijoz %s ga admin javobi yuborilmadi: %s",
-            client_id,
-            error
-        )
-
-        await message.reply_text(
-            "❌ Javob yuborilmadi.\n\n"
-            "Mijoz botni hali ishga tushirmagan "
-            "bo'lishi mumkin yoki Telegram xatoligi yuz berdi."
-        )
-
-
-# ============================================================
-# /CANCEL
-# ============================================================
-
-async def cancel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "❌ Jarayon bekor qilindi.\n\n"
-        "🏠 Asosiy menyu:",
-        reply_markup=main_menu_keyboard()
-    )
-
-    return MENU
-
-
-# ============================================================
-# /MYID
-# ============================================================
-
-async def my_id(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "🆔 Sizning Telegram ID raqamingiz:\n\n"
-        f"{update.effective_user.id}"
-    )
-
-
-# ============================================================
-# /ADDADMIN
-# ============================================================
-
-async def add_admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Bu buyruq faqat adminlar uchun."
-        )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Foydalanish:\n\n"
-            "/addadmin TELEGRAM_ID\n\n"
-            "Masalan:\n"
-            "/addadmin 123456789"
-        )
-        return
-
-    try:
-        new_admin_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Telegram ID faqat raqamlardan "
-            "iborat bo'lishi kerak."
-        )
-        return
-
-    if is_admin(new_admin_id):
-        await update.message.reply_text(
-            "ℹ️ Bu foydalanuvchi allaqachon admin."
-        )
-        return
-
-    add_admin(new_admin_id)
-
-    await update.message.reply_text(
-        "✅ Yangi admin qo'shildi.\n\n"
-        f"🆔 Telegram ID: {new_admin_id}"
-    )
-
-
-# ============================================================
-# /DELADMIN
-# ============================================================
-
-async def delete_admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Bu buyruq faqat adminlar uchun."
-        )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Foydalanish:\n\n"
-            "/deladmin TELEGRAM_ID"
-        )
-        return
-
-    try:
-        remove_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Telegram ID noto'g'ri."
-        )
-        return
-
-    if remove_id == user_id:
-        await update.message.reply_text(
-            "❌ O'zingizni adminlar ro'yxatidan "
-            "o'chira olmaysiz."
-        )
-        return
-
-    if not is_admin(remove_id):
-        await update.message.reply_text(
-            "ℹ️ Bu ID adminlar ro'yxatida yo'q."
-        )
-        return
-
-    remove_admin(remove_id)
-
-    await update.message.reply_text(
-        "✅ Admin o'chirildi.\n\n"
-        f"🆔 Telegram ID: {remove_id}"
-    )
-
-
-# ============================================================
-# /ADMINS
-# ============================================================
-
-async def admins_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Bu buyruq faqat adminlar uchun."
-        )
-        return
-
-    admins = get_admins()
-
-    if not admins:
+    context
