@@ -858,4 +858,3 @@ async def admins_command(
     admins = get_admins()
 
     if not admins:
-        await 
